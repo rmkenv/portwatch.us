@@ -1,5 +1,4 @@
-streamlit>=1.30.0
-websockets>=11.0
-pandas>=2.0.0
-folium>=0.15.0
-pydeck>=0.8.0
+dash
+pandas
+requests
+gunicorn
