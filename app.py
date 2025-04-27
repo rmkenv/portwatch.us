@@ -5,7 +5,7 @@ import websocket
 import threading
 import time
 import logging
-from dash import Dash, dcc, html, dash_table, Output, Input, State
+from dash import Dash, dcc, html, dash_table, Output, Input
 import sys
 
 # Configure logging
@@ -33,9 +33,8 @@ PORT_COORDINATES = {
 # Global vessel data store with thread safety
 vessel_data_lock = threading.Lock()
 vessel_data = {}  # MMSI -> vessel data
-max_vessels = 1000  # Maximum number of vessels to track
-last_update_time = 0
 websocket_connected = False
+last_update_time = 0
 
 # Sample data - always include this for fallback
 sample_data = [
@@ -65,6 +64,24 @@ sample_data = [
         "Speed": 0.0,
         "Course": 270,
         "Port": "Savannah"
+    },
+    {
+        "MMSI": "366789012",
+        "Ship Name": "Sample Vessel 4",
+        "Latitude": 36.88,
+        "Longitude": -76.33,
+        "Speed": 5.2,
+        "Course": 45,
+        "Port": "Norfolk"
+    },
+    {
+        "MMSI": "235678901",
+        "Ship Name": "Sample Vessel 5",
+        "Latitude": 29.61,
+        "Longitude": -94.99,
+        "Speed": 7.8,
+        "Course": 135,
+        "Port": "Houston"
     }
 ]
 
@@ -84,7 +101,7 @@ def on_message(ws, message):
     global vessel_data, last_update_time
     try:
         data = json.loads(message)
-        logger.info(f"Received message type: {type(data)}")
+        logger.info(f"Received message")
 
         # Check if this is a position report
         if "Message" in data and "PositionReport" in data["Message"]:
@@ -92,7 +109,6 @@ def on_message(ws, message):
             metadata = data["MetaData"]
 
             mmsi = str(position.get("UserID", ""))
-            logger.info(f"Processing position for MMSI: {mmsi}")
 
             # Only process foreign ships
             if is_foreign_ship(mmsi):
@@ -119,15 +135,6 @@ def on_message(ws, message):
                 # Thread-safe update of vessel data
                 with vessel_data_lock:
                     vessel_data[mmsi] = vessel_info
-                    logger.info(f"Updated vessel data. Total vessels: {len(vessel_data)}")
-
-                    # Limit the number of vessels we track
-                    if len(vessel_data) > max_vessels:
-                        # Remove oldest entries
-                        oldest_mmsis = sorted(vessel_data.keys(),
-                                             key=lambda k: vessel_data[k].get("Last Updated", 0))[:len(vessel_data) - max_vessels]
-                        for old_mmsi in oldest_mmsis:
-                            del vessel_data[old_mmsi]
 
                 last_update_time = time.time()
     except Exception as e:
@@ -143,10 +150,6 @@ def on_close(ws, close_status_code, close_msg):
     websocket_connected = False
     logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
 
-    # Try to reconnect after a delay
-    time.sleep(5)
-    start_websocket()
-
 def on_open(ws):
     global websocket_connected
     websocket_connected = True
@@ -154,8 +157,6 @@ def on_open(ws):
 
     # Subscribe to all position reports
     api_key = os.getenv("AISSTREAM_API_KEY", "")
-    logger.info(f"Using API key: {'*' * (len(api_key) if api_key else 0)}")
-
     subscribe_message = {
         "APIKey": api_key,
         "BoundingBoxes": [[[-180, -90], [180, 90]]]  # Global coverage
@@ -164,17 +165,12 @@ def on_open(ws):
     logger.info("Subscription message sent")
 
 def start_websocket():
-    global websocket_connected
-
     api_key = os.getenv("AISSTREAM_API_KEY")
     if not api_key:
-        logger.warning("AISSTREAM_API_KEY not set. WebSocket connection will fail.")
+        logger.warning("AISSTREAM_API_KEY not set. WebSocket connection will not be established.")
         return
 
     try:
-        # Enable trace for debugging
-        websocket.enableTrace(True)
-
         # Create WebSocket connection
         ws = websocket.WebSocketApp("wss://stream.aisstream.io/v0/stream",
                                     on_open=on_open,
@@ -243,12 +239,6 @@ app.layout = html.Div([
 def update_table(n_intervals, selected_ports):
     global vessel_data, last_update_time, websocket_connected
 
-    logger.info(f"Updating table. Interval: {n_intervals}, Selected ports: {selected_ports}")
-
-    # Check if we have an API key
-    api_key = os.getenv("AISSTREAM_API_KEY")
-    status_message = ""
-
     # WebSocket status
     if websocket_connected:
         ws_status = "Connected"
@@ -257,41 +247,45 @@ def update_table(n_intervals, selected_ports):
         ws_status = "Disconnected"
         ws_style = {"color": "red"}
 
-    # If we have real data, use it
+    # Get real vessel data if available
+    real_vessels = []
     with vessel_data_lock:
-        vessels = list(vessel_data.values())
-        logger.info(f"Current vessel count: {len(vessels)}")
+        real_vessels = list(vessel_data.values())
 
-    # If we have no real data, use sample data
-    if not vessels:
-        logger.info("No real vessel data, using sample data")
+    # Determine which data to use
+    if real_vessels:
+        vessels = real_vessels
+        status_message = f"Showing {len(vessels)} vessels from AIS Stream"
+    else:
         vessels = sample_data
-        status_message = "Using sample data. "
-
-        if not api_key:
-            status_message += "AISSTREAM_API_KEY not set."
+        status_message = "Using sample data"
+        if os.getenv("AISSTREAM_API_KEY"):
+            status_message += " (waiting for WebSocket data)"
         else:
-            status_message += "Waiting for WebSocket data..."
+            status_message += " (AISSTREAM_API_KEY not set)"
 
     # Filter by selected ports
     filtered_vessels = [v for v in vessels if v["Port"] in selected_ports]
-    logger.info(f"Filtered vessel count: {len(filtered_vessels)}")
 
     if not filtered_vessels:
-        status_message += " No vessels found for selected ports. Try selecting different ports."
+        status_message += ". No vessels found for selected ports. Try selecting different ports."
 
     # Format the last update time
     if last_update_time > 0:
         last_update = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_update_time))
     else:
-        last_update = "No data received yet"
+        if real_vessels:
+            last_update = "Data received but timestamp not recorded"
+        else:
+            last_update = "Using sample data"
 
     return filtered_vessels, status_message, last_update, ws_status, ws_style
 
-# Initialize the WebSocket connection when the module loads
-logger.info("Initializing application")
-start_websocket()
+# Try to start the WebSocket connection
+try:
+    start_websocket()
+except Exception as e:
+    logger.error(f"Failed to start WebSocket: {str(e)}")
 
 if __name__ == "__main__":
-    logger.info("Starting Dash server...")
-    app.run_server(debug=True)  # Set debug=True for more information
+    app.run_server(debug=True)
