@@ -1,4 +1,4 @@
 dash
 pandas
-websockets
+websocket-client
 gunicorn
