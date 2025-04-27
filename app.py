@@ -1,9 +1,7 @@
-import streamlit as st
-import websockets
-import json
-import asyncio
+import os
+import requests
 import pandas as pd
-from threading import Thread
+from dash import Dash, dcc, html, dash_table, Output, Input
 
 # Top 10 US ports with coordinates (latitude, longitude)
 PORT_COORDINATES = {
@@ -20,92 +18,80 @@ PORT_COORDINATES = {
 }
 
 def is_foreign_ship(mmsi: str) -> bool:
-    """Check if ship is foreign using MMSI country code"""
     return mmsi.startswith(('2', '3', '4'))  # Non-US country codes
 
-async def ais_stream_consumer():
-    async with websockets.connect("wss://stream.aisstream.io/v0/stream") as websocket:
-        subscription = {
-            "APIKey": st.secrets["AISSTREAM_API_KEY"],
-            "BoundingBoxes": [[[lat-0.5, lon-0.5], [lat+0.5, lon+0.5]] 
-                            for lat, lon in PORT_COORDINATES.values()],
-            "FilterMessageTypes": ["PositionReport"]
-        }
-        await websocket.send(json.dumps(subscription))
-        
-        async for message in websocket:
-            data = json.loads(message)
-            if data["MessageType"] == "PositionReport":
-                vessel = data["Message"]["PositionReport"]
-                metadata = data["Metadata"]
-                
-                if is_foreign_ship(str(vessel["UserID"])):
-                    new_row = {
-                        "MMSI": vessel["UserID"],
-                        "Ship Name": metadata.get("ShipName", "Unknown"),
-                        "Latitude": vessel["Latitude"],
-                        "Longitude": vessel["Longitude"],
-                        "Speed": vessel["Sog"],
-                        "Course": vessel["Cog"],
-                        "Port": "Unknown"
-                    }
-                    
-                    # Determine nearest port
-                    current_pos = (vessel["Latitude"], vessel["Longitude"])
-                    new_row["Port"] = min(PORT_COORDINATES.items(),
-                                        key=lambda x: abs(x[1][0]-current_pos[0]) + 
-                                                       abs(x[1][1]-current_pos[1]))[0]
-                    
-                    st.session_state.vessels.append(new_row)
-                    st.session_state.vessels = st.session_state.vessels[-1000:]
+def fetch_ais_data(api_key):
+    # Replace with the actual endpoint and parameters for aisstream.io
+    url = "https://stream.aisstream.io/v0/broadcast"  # Example endpoint
+    headers = {"Authorization": f"Bearer {api_key}"}
+    # This is a placeholder; adapt to the actual API
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        return []
+    data = response.json()
+    vessels = []
+    for item in data.get("messages", []):
+        vessel = item.get("PositionReport", {})
+        metadata = item.get("Metadata", {})
+        mmsi = str(vessel.get("UserID", ""))
+        if is_foreign_ship(mmsi):
+            lat, lon = vessel.get("Latitude"), vessel.get("Longitude")
+            # Find nearest port
+            port = min(PORT_COORDINATES.items(), key=lambda x: abs(x[1][0]-lat) + abs(x[1][1]-lon))[0]
+            vessels.append({
+                "MMSI": mmsi,
+                "Ship Name": metadata.get("ShipName", "Unknown"),
+                "Latitude": lat,
+                "Longitude": lon,
+                "Speed": vessel.get("Sog"),
+                "Course": vessel.get("Cog"),
+                "Port": port
+            })
+    return vessels
 
-def start_websocket():
-    asyncio.new_event_loop().run_until_complete(ais_stream_consumer())
+# Dash app setup
+app = Dash(__name__)
+server = app.server  # For Render deployment
 
-# Streamlit UI Configuration
-st.set_page_config(page_title="Maritime Monitor", layout="wide")
-st.title("🚢 Real-Time Foreign Vessel Tracking")
-st.markdown("Monitoring top 10 US ports using AISStream.io")
+app.layout = html.Div([
+    html.H1("Foreign Ships at Top 10 Busiest US Ports"),
+    dcc.Dropdown(
+        id="port-filter",
+        options=[{"label": k, "value": k} for k in PORT_COORDINATES.keys()],
+        value=list(PORT_COORDINATES.keys()),
+        multi=True,
+        placeholder="Select ports to filter"
+    ),
+    dcc.Interval(id='interval-component', interval=60*1000, n_intervals=0),  # Poll every 60 seconds
+    dash_table.DataTable(
+        id='vessel-table',
+        columns=[
+            {"name": "MMSI", "id": "MMSI"},
+            {"name": "Ship Name", "id": "Ship Name"},
+            {"name": "Port", "id": "Port"},
+            {"name": "Speed", "id": "Speed"},
+            {"name": "Course", "id": "Course"},
+            {"name": "Latitude", "id": "Latitude"},
+            {"name": "Longitude", "id": "Longitude"},
+        ],
+        data=[],
+        page_size=20,
+        style_table={'overflowX': 'auto'}
+    )
+])
 
-# Initialize session state
-if "vessels" not in st.session_state:
-    st.session_state.vessels = []
+@app.callback(
+    Output('vessel-table', 'data'),
+    Input('interval-component', 'n_intervals'),
+    Input('port-filter', 'value')
+)
+def update_table(n_intervals, selected_ports):
+    api_key = os.getenv("AISSTREAM_API_KEY")
+    if not api_key:
+        return []
+    vessels = fetch_ais_data(api_key)
+    filtered = [v for v in vessels if v["Port"] in selected_ports]
+    return filtered
 
-# Start WebSocket thread
-if not st.session_state.get("ws_running"):
-    Thread(target=start_websocket, daemon=True).start()
-    st.session_state.ws_running = True
-
-# Dashboard Layout
-col1, col2 = st.columns([3, 2])
-
-with col1:
-    st.subheader("Live Ship Positions")
-    if st.session_state.vessels:
-        st.map(pd.DataFrame(st.session_state.vessels), 
-              latitude='Latitude', longitude='Longitude',
-              color='#FF0000', size=15)
-    else:
-        st.info("Awaiting vessel data...")
-
-with col2:
-    st.subheader("Vessel Details")
-    port_filter = st.multiselect("Filter by Port", 
-                                options=list(PORT_COORDINATES.keys()),
-                                default=list(PORT_COORDINATES.keys()))
-    
-    filtered_data = [v for v in st.session_state.vessels 
-                    if v["Port"] in port_filter] if port_filter else st.session_state.vessels
-    
-    if filtered_data:
-        st.dataframe(pd.DataFrame(filtered_data)[["MMSI", "Ship Name", "Port", "Speed", "Course"]],
-                    height=600,
-                    column_config={
-                        "Speed": st.column_config.ProgressColumn(
-                            format="%.1f knots",
-                            min_value=0,
-                            max_value=30
-                        )
-                    })
-    else:
-        st.warning("No vessels in selected ports")
+if __name__ == "__main__":
+    app.run_server(debug=False)
