@@ -4,8 +4,17 @@ import pandas as pd
 import websocket
 import threading
 import time
+import logging
 from dash import Dash, dcc, html, dash_table, Output, Input, State
-from collections import deque
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 # Top 10 US ports with coordinates (latitude, longitude)
 PORT_COORDINATES = {
@@ -26,17 +35,56 @@ vessel_data_lock = threading.Lock()
 vessel_data = {}  # MMSI -> vessel data
 max_vessels = 1000  # Maximum number of vessels to track
 last_update_time = 0
+websocket_connected = False
+
+# Sample data - always include this for fallback
+sample_data = [
+    {
+        "MMSI": "220123456",
+        "Ship Name": "Sample Vessel 1",
+        "Latitude": 33.75,
+        "Longitude": -118.26,
+        "Speed": 12.5,
+        "Course": 180,
+        "Port": "Los Angeles"
+    },
+    {
+        "MMSI": "345678901",
+        "Ship Name": "Sample Vessel 2",
+        "Latitude": 40.67,
+        "Longitude": -74.18,
+        "Speed": 8.3,
+        "Course": 90,
+        "Port": "New York/New Jersey"
+    },
+    {
+        "MMSI": "412345678",
+        "Ship Name": "Sample Vessel 3",
+        "Latitude": 32.03,
+        "Longitude": -81.15,
+        "Speed": 0.0,
+        "Course": 270,
+        "Port": "Savannah"
+    }
+]
 
 def is_foreign_ship(mmsi: str) -> bool:
-    return mmsi.startswith(('2', '3', '4'))  # Non-US country codes
+    try:
+        return mmsi.startswith(('2', '3', '4'))  # Non-US country codes
+    except:
+        return False
 
 def find_nearest_port(lat, lon):
-    return min(PORT_COORDINATES.items(), key=lambda x: abs(x[1][0]-lat) + abs(x[1][1]-lon))[0]
+    try:
+        return min(PORT_COORDINATES.items(), key=lambda x: abs(x[1][0]-lat) + abs(x[1][1]-lon))[0]
+    except:
+        return "Unknown"
 
 def on_message(ws, message):
     global vessel_data, last_update_time
     try:
         data = json.loads(message)
+        logger.info(f"Received message type: {type(data)}")
 
         # Check if this is a position report
         if "Message" in data and "PositionReport" in data["Message"]:
@@ -44,6 +92,7 @@ def on_message(ws, message):
             metadata = data["MetaData"]
 
             mmsi = str(position.get("UserID", ""))
+            logger.info(f"Processing position for MMSI: {mmsi}")
 
             # Only process foreign ships
             if is_foreign_ship(mmsi):
@@ -64,13 +113,13 @@ def on_message(ws, message):
                     "Longitude": lon,
                     "Speed": position.get("Sog"),
                     "Course": position.get("Cog"),
-                    "Port": port,
-                    "Last Updated": time.time()
+                    "Port": port
                 }
 
                 # Thread-safe update of vessel data
                 with vessel_data_lock:
                     vessel_data[mmsi] = vessel_info
+                    logger.info(f"Updated vessel data. Total vessels: {len(vessel_data)}")
 
                     # Limit the number of vessels we track
                     if len(vessel_data) > max_vessels:
@@ -82,74 +131,76 @@ def on_message(ws, message):
 
                 last_update_time = time.time()
     except Exception as e:
-        print(f"Error processing message: {str(e)}")
+        logger.error(f"Error processing message: {str(e)}")
 
 def on_error(ws, error):
-    print(f"WebSocket error: {error}")
+    global websocket_connected
+    websocket_connected = False
+    logger.error(f"WebSocket error: {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print(f"WebSocket closed: {close_status_code} - {close_msg}")
+    global websocket_connected
+    websocket_connected = False
+    logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+
+    # Try to reconnect after a delay
+    time.sleep(5)
+    start_websocket()
 
 def on_open(ws):
-    print("WebSocket connection established")
+    global websocket_connected
+    websocket_connected = True
+    logger.info("WebSocket connection established")
+
     # Subscribe to all position reports
+    api_key = os.getenv("AISSTREAM_API_KEY", "")
+    logger.info(f"Using API key: {'*' * (len(api_key) if api_key else 0)}")
+
     subscribe_message = {
-        "APIKey": os.getenv("AISSTREAM_API_KEY", ""),
+        "APIKey": api_key,
         "BoundingBoxes": [[[-180, -90], [180, 90]]]  # Global coverage
     }
     ws.send(json.dumps(subscribe_message))
-    print("Subscription message sent")
+    logger.info("Subscription message sent")
 
 def start_websocket():
-    global ws
+    global websocket_connected
+
     api_key = os.getenv("AISSTREAM_API_KEY")
     if not api_key:
-        print("Warning: AISSTREAM_API_KEY not set. WebSocket connection will fail.")
+        logger.warning("AISSTREAM_API_KEY not set. WebSocket connection will fail.")
         return
 
-    # Create WebSocket connection
-    ws = websocket.WebSocketApp("wss://stream.aisstream.io/v0/stream",
-                                on_open=on_open,
-                                on_message=on_message,
-                                on_error=on_error,
-                                on_close=on_close)
+    try:
+        # Enable trace for debugging
+        websocket.enableTrace(True)
 
-    # Start WebSocket in a separate thread
-    wst = threading.Thread(target=ws.run_forever)
-    wst.daemon = True
-    wst.start()
+        # Create WebSocket connection
+        ws = websocket.WebSocketApp("wss://stream.aisstream.io/v0/stream",
+                                    on_open=on_open,
+                                    on_message=on_message,
+                                    on_error=on_error,
+                                    on_close=on_close)
 
-# Sample data for testing without API key
-sample_data = [
-    {
-        "MMSI": "220123456",
-        "Ship Name": "Sample Vessel 1",
-        "Latitude": 33.75,
-        "Longitude": -118.26,
-        "Speed": 12.5,
-        "Course": 180,
-        "Port": "Los Angeles",
-        "Last Updated": time.time()
-    },
-    {
-        "MMSI": "345678901",
-        "Ship Name": "Sample Vessel 2",
-        "Latitude": 40.67,
-        "Longitude": -74.18,
-        "Speed": 8.3,
-        "Course": 90,
-        "Port": "New York/New Jersey",
-        "Last Updated": time.time()
-    }
-]
+        # Start WebSocket in a separate thread
+        wst = threading.Thread(target=ws.run_forever)
+        wst.daemon = True
+        wst.start()
+        logger.info("WebSocket thread started")
+    except Exception as e:
+        logger.error(f"Error starting WebSocket: {str(e)}")
 
 # Dash app setup
-app = Dash(__name__)
+app = Dash(__name__, suppress_callback_exceptions=True)
 server = app.server  # For Render deployment
 
 app.layout = html.Div([
     html.H1("Foreign Ships at Top 10 Busiest US Ports"),
     html.Div(id="status-message", style={"color": "red"}),
+    html.Div([
+        html.Span("WebSocket Status: "),
+        html.Span(id="websocket-status")
+    ]),
     html.Div([
         html.Span("Last updated: "),
         html.Span(id="last-update-time")
@@ -173,7 +224,7 @@ app.layout = html.Div([
             {"name": "Latitude", "id": "Latitude"},
             {"name": "Longitude", "id": "Longitude"},
         ],
-        data=[],
+        data=sample_data,  # Initialize with sample data
         page_size=20,
         style_table={'overflowX': 'auto'},
         sort_action='native'
@@ -183,52 +234,64 @@ app.layout = html.Div([
 @app.callback(
     [Output('vessel-table', 'data'),
      Output('status-message', 'children'),
-     Output('last-update-time', 'children')],
+     Output('last-update-time', 'children'),
+     Output('websocket-status', 'children'),
+     Output('websocket-status', 'style')],
     [Input('interval-component', 'n_intervals'),
      Input('port-filter', 'value')]
 )
 def update_table(n_intervals, selected_ports):
-    global vessel_data, last_update_time
+    global vessel_data, last_update_time, websocket_connected
+
+    logger.info(f"Updating table. Interval: {n_intervals}, Selected ports: {selected_ports}")
 
     # Check if we have an API key
     api_key = os.getenv("AISSTREAM_API_KEY")
     status_message = ""
 
-    if not api_key:
-        status_message = "Warning: AISSTREAM_API_KEY environment variable not set. Using sample data."
-        # Use sample data if no API key
-        filtered_vessels = [v for v in sample_data if v["Port"] in selected_ports]
-        last_update = "N/A (using sample data)"
+    # WebSocket status
+    if websocket_connected:
+        ws_status = "Connected"
+        ws_style = {"color": "green"}
     else:
-        # Get a thread-safe copy of the vessel data
-        with vessel_data_lock:
-            vessels = list(vessel_data.values())
+        ws_status = "Disconnected"
+        ws_style = {"color": "red"}
 
-        # Filter by selected ports
-        filtered_vessels = [v for v in vessels if v["Port"] in selected_ports]
+    # If we have real data, use it
+    with vessel_data_lock:
+        vessels = list(vessel_data.values())
+        logger.info(f"Current vessel count: {len(vessels)}")
 
-        if not vessels:
-            status_message = "No vessel data received yet. Waiting for WebSocket data..."
-        elif not filtered_vessels:
-            status_message = "No vessels found for selected ports. Try selecting different ports."
+    # If we have no real data, use sample data
+    if not vessels:
+        logger.info("No real vessel data, using sample data")
+        vessels = sample_data
+        status_message = "Using sample data. "
 
-        # Format the last update time
-        if last_update_time > 0:
-            last_update = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_update_time))
+        if not api_key:
+            status_message += "AISSTREAM_API_KEY not set."
         else:
-            last_update = "No data received yet"
+            status_message += "Waiting for WebSocket data..."
 
-    # Remove the "Last Updated" field before sending to the table
-    for vessel in filtered_vessels:
-        if "Last Updated" in vessel:
-            vessel_copy = vessel.copy()
-            vessel_copy.pop("Last Updated", None)
+    # Filter by selected ports
+    filtered_vessels = [v for v in vessels if v["Port"] in selected_ports]
+    logger.info(f"Filtered vessel count: {len(filtered_vessels)}")
 
-    return filtered_vessels, status_message, last_update
+    if not filtered_vessels:
+        status_message += " No vessels found for selected ports. Try selecting different ports."
+
+    # Format the last update time
+    if last_update_time > 0:
+        last_update = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_update_time))
+    else:
+        last_update = "No data received yet"
+
+    return filtered_vessels, status_message, last_update, ws_status, ws_style
+
+# Initialize the WebSocket connection when the module loads
+logger.info("Initializing application")
+start_websocket()
 
 if __name__ == "__main__":
-    print("Starting WebSocket connection...")
-    start_websocket()
-
-    print("Starting Dash server...")
+    logger.info("Starting Dash server...")
     app.run_server(debug=True)  # Set debug=True for more information
